@@ -40,8 +40,17 @@ fmt_reset() {
     fi
 }
 
+to_pct() {
+    # Anthropic reports utilization as a 0-1 fraction (e.g. 0.36 == 36% used).
+    local val="$1"
+    [[ -z "$val" || "$val" == "?" || "$val" == "null" ]] && { echo "$val"; return; }
+    awk -v v="$val" 'BEGIN { printf "%.2f", v * 100 }' | sed -E 's/\.?0+$//'
+}
+
 print_report() {
-    local five_h_pct="$1" five_h_reset="$2" week_pct="$3" week_reset="$4"
+    local five_h_pct five_h_reset week_pct week_reset
+    five_h_pct=$(to_pct "$1"); five_h_reset="$2"
+    week_pct=$(to_pct "$3"); week_reset="$4"
     printf '5-hour session:  %s%% used   resets %s\n' "$five_h_pct" "$(fmt_reset "$five_h_reset")"
     printf 'Weekly limit:    %s%% used   resets %s\n' "$week_pct" "$(fmt_reset "$week_reset")"
 }
