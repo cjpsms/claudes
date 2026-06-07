@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Show current usage against Claude's 5-hour session limit and weekly limit,
+# reusing Claude Code's existing logged-in OAuth session (no separate API key).
+set -euo pipefail
+
+CREDS="$HOME/.claude/.credentials.json"
+
+if [[ ! -f "$CREDS" ]]; then
+    echo "claudes: no Claude Code session found at $CREDS — log in with \`claude\` first." >&2
+    exit 1
+fi
+
+ACCESS_TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS")
+EXPIRES_AT=$(jq -r '.claudeAiOauth.expiresAt // empty' "$CREDS")
+
+if [[ -z "$ACCESS_TOKEN" ]]; then
+    echo "claudes: couldn't read an access token from $CREDS — log in with \`claude\` first." >&2
+    exit 1
+fi
+
+NOW_MS=$(($(date +%s) * 1000))
+if [[ -n "$EXPIRES_AT" && "$NOW_MS" -ge "$EXPIRES_AT" ]]; then
+    echo "claudes: your Claude Code session has expired — run \`claude\` to refresh it, then try again." >&2
+    exit 1
+fi
+
+HEADER_FILE=$(mktemp)
+BODY_FILE=$(mktemp)
+USAGE_BODY_FILE=$(mktemp)
+trap 'rm -f "$HEADER_FILE" "$BODY_FILE" "$USAGE_BODY_FILE"' EXIT
+
+fmt_reset() {
+    # Accepts an epoch (seconds or ISO-8601) reset value and prints it as local time.
+    local val="$1"
+    [[ -z "$val" || "$val" == "null" ]] && { echo "unknown"; return; }
+    if [[ "$val" =~ ^[0-9]+$ ]]; then
+        date -d "@$val" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$val"
+    else
+        date -d "$val" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$val"
+    fi
+}
+
+print_report() {
+    local five_h_pct="$1" five_h_reset="$2" week_pct="$3" week_reset="$4"
+    printf '5-hour session:  %s%% used   resets %s\n' "$five_h_pct" "$(fmt_reset "$five_h_reset")"
+    printf 'Weekly limit:    %s%% used   resets %s\n' "$week_pct" "$(fmt_reset "$week_reset")"
+}
+
+# --- Primary: a 1-token Haiku call, then read the rate-limit headers Anthropic
+# returns on every Messages API response. -----------------------------------
+HTTP_CODE=$(curl -s -o "$BODY_FILE" -D "$HEADER_FILE" -w '%{http_code}' \
+    https://api.anthropic.com/v1/messages \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "content-type: application/json" \
+    -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}')
+
+if [[ "$HTTP_CODE" =~ ^2 ]]; then
+    get_header() { grep -i "^$1:" "$HEADER_FILE" | tail -1 | cut -d':' -f2- | tr -d '\r' | sed 's/^ //'; }
+
+    five_h_util=$(get_header "anthropic-ratelimit-unified-5h-utilization")
+    five_h_reset=$(get_header "anthropic-ratelimit-unified-5h-reset")
+    week_util=$(get_header "anthropic-ratelimit-unified-7d-utilization")
+    week_reset=$(get_header "anthropic-ratelimit-unified-7d-reset")
+
+    if [[ -n "$five_h_util" || -n "$week_util" ]]; then
+        print_report "${five_h_util:-?}" "$five_h_reset" "${week_util:-?}" "$week_reset"
+        exit 0
+    fi
+    # 2xx but no unified rate-limit headers present — fall through to the usage endpoint.
+fi
+
+# --- Fallback: the dedicated OAuth usage endpoint that backs Claude Code's
+# own `/usage` display — returns 5h/7d usage directly as JSON. ---------------
+USAGE_HTTP_CODE=$(curl -s -o "$USAGE_BODY_FILE" -w '%{http_code}' \
+    https://api.anthropic.com/api/oauth/usage \
+    -H "Authorization: Bearer $ACCESS_TOKEN")
+
+if [[ "$USAGE_HTTP_CODE" =~ ^2 ]]; then
+    five_h_util=$(jq -r '(.five_hour.utilization // .["5h"].utilization // empty)' "$USAGE_BODY_FILE")
+    five_h_reset=$(jq -r '(.five_hour.resets_at // .["5h"].resets_at // empty)' "$USAGE_BODY_FILE")
+    week_util=$(jq -r '(.seven_day.utilization // .["7d"].utilization // empty)' "$USAGE_BODY_FILE")
+    week_reset=$(jq -r '(.seven_day.resets_at // .["7d"].resets_at // empty)' "$USAGE_BODY_FILE")
+
+    if [[ -n "$five_h_util" || -n "$week_util" ]]; then
+        print_report "${five_h_util:-?}" "$five_h_reset" "${week_util:-?}" "$week_reset"
+        exit 0
+    fi
+
+    echo "claudes: usage endpoint responded but the data shape was unexpected:" >&2
+    cat "$USAGE_BODY_FILE" >&2
+    exit 1
+fi
+
+echo "claudes: couldn't read usage limits (messages API: $HTTP_CODE, usage endpoint: $USAGE_HTTP_CODE)" >&2
+echo "--- messages API response ---" >&2
+cat "$BODY_FILE" >&2
+echo "--- usage endpoint response ---" >&2
+cat "$USAGE_BODY_FILE" >&2
+exit 1
